@@ -1,0 +1,1426 @@
+---
+title: "Using ggplot to visualize data and statistical results "
+author: "Samantha Lee"
+date: "04/01/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# set default image output size in knitted html doc
+# suppress output of warnings and messages
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.width=6, 
+                      fig.height=4,
+                      message = F,
+                      warning = F)
+```
+
+## Document overview
+
+This document was creating using [R Markdown](http://rmarkdown.rstudio.com). R Markdown is great tool to help organize and annotate your code, thus improving tranferability and reproducability of your methods. Code created in R Markdown can be "knitted" into HTML, PDF, and MS word documents. For this workshop, a corresponding HTML document has been created. Feel free to follow along using either the raw .Rmd document or the HTML document. 
+
+## Workshop overview
+
+The purpose of this workshop is to provide a brief introduction to the [ggplot2 package](https://ggplot2.tidyverse.org/index.html) for creating publication-quality figures. The ggplot2 package is part of the [tidyverse](https://www.tidyverse.org/). We will continue to practice using "[tidy language](https://r4ds.had.co.nz/tidy-data.html)" code in this workshop. This workshop will also demonstrate how to use base R to conduct basic statistical analyses, such as t-tests. Finally, we will practice using ggplot to display data and indicate statistically important information, such as significance differences and linear relationships. 
+
+You may be asking yourself what is the difference between ggplot2 and ggplot. Most simply put, they are the same! However, ggplot2 refers to the package and ggplot refers to the ggplot() command used to initialize a plot! 
+
+*Disclaimer*: I am not a statistician and this workshop is not intended to teach you how to choose the appropriate statistical approach for your research question. While I am always happy to discuss and help to the best of my ability, I suggest that for more complex statistical questions you consider deferring to the statisticians at the [Centre for Health Care Innovation (CHI)](https://www.chimb.ca/). All RFHS graduate students are entitled to 5 hours of free consultation at the CHI. 
+
+## Data set 
+
+This workshop will use data from the [E. Mick *et. al.* (2020)](https://www.nature.com/articles/s41467-020-19587-y) paper titled *Upper airway gene expression reveals suppressed immune responses to SARS-CoV-2 compared with other respiratory viruses*. Data is provided to you through the MMID github repository and can also be found on [NCBI GEO](https://www.ncbi.nlm.nih.gov/geo/) by searching the accession code GSE156063. This data set includes gene counts, cell type estimates, age, and sex information from 234 patients with acute respiratory infections, including COVID-19. 
+
+In today's workshop we'll recreate Figures 1C and 1D to learn ggplot, how to run some basic statistics, how to create bars to indicate significance, and how to visualize linear relationships.  
+
+![](https://media.springernature.com/full/springer-static/image/art%3A10.1038%2Fs41467-020-19587-y/MediaObjects/41467_2020_19587_Fig1_HTML.png?as=webp)
+
+## Getting started
+
+First, we must load the R packages that we need to conduct our analyses. I prefer to include these  at the top of my code for easy reference, while others load them as needed. If you do not already have these packages you will need to download them using the install.packages command. Some of these packages, including biomaRt, GEOguery, limma, and edgeR are part of [Bioconductor](https://bioconductor.org/), which is an open-source repository of bioinformatics-related packages. To download these packages you must first [install the bioconductor package]("https://www.bioconductor.org/install/") and then install these packages using the command BiocManager::install(). 
+```{r load_packages, message=F}
+library(tidyverse) # the tidyverse package also loads ggplot2
+library(here) # the here package makes it easier to load and save files through simple directory calling 
+library(readxl) # read in xlsx files
+library(GEOquery) # for accessing the geo accession data
+library(biomaRt) # geo ensembl names
+library(limma) # for running differential expression
+library(edgeR) # for voom 
+# ggbeeswarm is for point plotting
+# must download dev version from git for corrals to work 
+# devtools::install_github("eclarke/ggbeeswarm")
+library(ggbeeswarm) 
+library(ggsignif) # significance bars
+library(robustbase) # linear regressions in fig1d
+library(ggeffects) # for calculating marginal effects
+library(cowplot) # alternate to faceting for combining individual plots
+```
+
+
+Next, we have to read in our data. 
+```{r data_in}
+# get geo data, which contains the metadata 
+gse_mat <- getGEO('GSE156063',GSEMatrix=TRUE)
+pdata <- pData(phenoData(gse_mat[[1]]))
+glimpse(pdata) # check size; quickly examine the pdata
+
+# the pdata has a lot of info not relevant to this workshop
+# let's clean up naming and select only the relevant columns
+# clean up pdata
+pdata_sub <- pdata %>% 
+  # mutate creates new columns based on existing columns
+  # also lets you change class of existing columns
+  mutate(sex = as.factor(gsub("gender: ", "", characteristics_ch1)),
+         age = as.numeric(gsub("age: ", "", characteristics_ch1.1)),
+         disease_state = `disease state:ch1`,
+         sarscov2_pcr = as.numeric(`sars-cov-2 pcr:ch1`), 
+         sarscov2_rpm = as.factor(`sars-cov-2 rpm:ch1`),
+         participant_ID = description) %>%
+  mutate(disease_state = as.factor(gsub("[[:space:]]", "", disease_state))) %>%
+  # select specific columns
+  dplyr::select(participant_ID, sarscov2_pcr, sarscov2_rpm, disease_state, age, sex)
+
+# read in the gene counts data 
+# this is included in the supplement geo accession data
+# gene counts have already been filted 
+exp <- read.csv(file = here("input_data",
+                            "GSE156063_swab_gene_counts.csv"))
+dim(exp) # check size
+
+# make ensembl id the rowname, then remove ensembl column
+rownames(exp) <- exp$X
+exp <- exp %>% dplyr::select(-X)
+
+# the expression data has one more participant than pdata
+# this individual should be removed
+# subset for individuals with pdata info
+exp_sub <- exp %>% 
+  dplyr::select(pdata_sub$participant_ID)
+
+# read in cell estimates
+# this was supp data included with the paper
+cells <- read_xlsx(here("input_data", "cell_estimates.xlsx"))
+
+# lets participants are in the same order in all data frames
+# this will make sure we dont accidentally analyze the wrong data
+identical(colnames(exp_sub), pdata_sub$participant_ID) # TRUE
+identical(pdata_sub$participant_ID, cells$CZB_ID) # FALSE
+
+# reorder cells to match pdata
+cells <- cells[order(match(cells$CZB_ID, pdata_sub$participant_ID,)),]
+
+# recheck if they match now
+identical(pdata_sub$participant_ID, cells$CZB_ID) # TRUE
+```
+
+## Differential expression with limma and voom (edgeR)
+
+Limma is an R package developed to look at associations between exposures/outcomes of interest and microarray omic data such as gene expression or DNA methylation. I've recreated the author's analysis based on the paper methods. I don't have a lot of experience with voom so I followed this pipeline: https://ucdavis-bioinformatics-training.github.io/2018-June-RNA-Seq-Workshop/thursday/DE.html. 
+
+**Note**: Jessy Slota will discuss RNA-seq analysis more in-depth on March 9, 2022. RNA-seq differs from microarray analysis in that it profiles the whole transcriptome while microarray analysis only interrogates a subset of genes defined on the array. 
+
+```{r de_analysis}
+
+##############################################
+# array wide DE analysis with limma and voom #
+##############################################
+
+# create model matrix - specified in paper
+# the model matrix accepts a linear regression formula
+# in general, linear regression are specified as y ~ x 
+# in this paper, the authors specified the intercept as 0 
+# setting the intercept to 0 will allow us to 
+# investigate differences in gene expression between groups later 
+# this website does a good job of explaining how 
+# setting intercepts changes interpretation
+# https://genomicsclass.github.io/book/pages/interactions_and_contrasts.html
+# sex and age are covariates that may introduce noise into our data
+# by including them in our model matrix we are removing that noise
+mod <- model.matrix(~0 + disease_state + sex + age, pdata_sub)
+
+# quantile normalization as per paper methods
+# voom plot looks "good" - should look smooth
+exp_norm <- voom(exp_sub, mod, normalize="quantile", plot = T)
+
+# fit with limma
+# fitting is based to you model matrix, we fit the gene count data
+fit <- lmFit(exp_norm, mod)
+head(coef(fit))
+
+##################
+# make contrasts #
+##################
+
+# contrasts are matrices that tell limma what values to compare to one another
+# we will make one for each of our comparisons
+
+# covid vs no virus
+sc_novirus <- makeContrasts(disease_stateSC2 - disease_statenovirus,
+                            levels = colnames(coef(fit)))
+sc_novirus
+
+# covid vs other virus
+sc_other <- makeContrasts(disease_stateSC2 - disease_stateothervirus,
+                          levels = colnames(coef(fit)))
+sc_other
+
+# other virus vs no virus
+other_novirus <- makeContrasts(disease_stateothervirus - disease_statenovirus,
+                               levels = colnames(coef(fit)))
+other_novirus
+
+##############################
+# fit contrast for each gene #
+##############################
+
+# we apply the constrats to our model fit to get info for each comparison
+sc_novirus_contr_fit <- contrasts.fit(fit, sc_novirus)
+sc_other_contr_fit <- contrasts.fit(fit, sc_other)
+other_novirus_contr_fit <- contrasts.fit(fit, other_novirus)
+
+###################################
+# ebayes smooth for each contrast #
+###################################
+
+# the ebayes process smoothes the data 
+sc_novirus_ebayes <- eBayes(sc_novirus_contr_fit)
+sc_other_ebayes <- eBayes(sc_other_contr_fit)
+other_novirus_ebayes <- eBayes(other_novirus_contr_fit)
+
+##################################################################
+# top table adjusted for bejamini hochberg fdr for each contrast #
+##################################################################
+
+# the top table function orders the data according to p-value
+# the authors adjusted for false discovery rate using the 
+# Benjamini Hochberg (BH) method
+sc_novirus_top <- topTable(sc_novirus_ebayes, sort.by = "P", 
+                           adjust.method="BH", n = Inf, confint = T)
+sc_other_top <- topTable(sc_other_ebayes, sort.by = "P", 
+                         adjust.method="BH", n = Inf, confint = T)
+other_novirus_top <- topTable(other_novirus_ebayes, sort.by = "P", 
+                              adjust.method="BH", n = Inf, confint = T)
+
+# make unique name in each comparison for combining later
+colnames(sc_novirus_top) <- paste("sc_novirus_",
+                                  colnames(sc_novirus_top), sep="")
+colnames(sc_other_top) <- paste("sc_other_",
+                                colnames(sc_other_top), sep="")
+colnames(other_novirus_top) <- paste("other_novirus_",
+                                     colnames(other_novirus_top), sep="")
+
+# match the row order of sc_other and other_novirus to sc_novirus
+sc_other_top <- sc_other_top[order(match(rownames(sc_other_top),
+                                         rownames(sc_novirus_top))),]
+other_novirus_top <- other_novirus_top[order(match(rownames(other_novirus_top),
+                                                   rownames(sc_novirus_top))),]
+
+# check that they are now in the same order
+identical(rownames(sc_novirus_top), rownames(sc_other_top)) # TRUE
+identical(rownames(sc_novirus_top), rownames(other_novirus_top)) # TRUE
+
+# cbind top tables together
+de <- cbind(sc_novirus_top, sc_other_top, other_novirus_top)
+de$ensembl_gene_id <- rownames(de)
+
+# get gene name annotation for ensembl
+# use human (hsapiens) data set
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+
+# get gene list
+gene_list <- getBM(filters= "ensembl_gene_id", 
+                   attributes= c("ensembl_gene_id","hgnc_symbol"),
+                   values=rownames(de),
+                   mart= mart)
+
+# add in gene symbol
+de <- de %>% 
+  right_join(gene_list, by = "ensembl_gene_id")
+```
+
+## ggplot2 
+
+There is a myriad of plot types that are handled by ggplot2 and base R including line plots, bar plots, box plots, and point plots. Though the syntax of both methods is quite different, you can ultimately obtain the same plot using either method. However, I find the syntax of ggplot is easier to follow, and that the aesthetics of a ggplot are easier to modify. 
+
+### Basic ggplot usage
+
+Every ggplot begins with a call to ggplot(). In ggplot() we will specify the data we are using as well as basic aesthetics (aes()) such as which data belong on the x and y axis. From there, we can specify the type of plot we want, which is referred to as a geom (e.g. geom_boxplot()). We can also fine tune the look of the plot, including altering the legend and plot font size, colour, and font family using the theme() command. Ggplot has some built in themes as well. You can continue adding layers and modifying them until you achieve the plot you want! It's easier to learn while doing, so this workshop will focus on practice. Each new layer is added to the plot using a "+". You can add the layers all at once, or you can save your plot, add a new layer, and save again. Removing layers is not straightforward, so I prefer the latter. (If you are interested in removing layers yourself, this [thread](https://stackoverflow.com/questions/13407236/remove-a-layer-from-a-ggplot2-chart) on stackoverflow is a great place to start, though I would not recommend this)/
+
+
+### Figure 1C: Cell counts by disease state 
+
+Let's begin out introduction to ggplot by recreating figure 1c from the paper. This figure has a violin plot with points layered on top. A violin plot is essentially a mirrored density plot of y-axis data. The data is plotted separately for disease state and also coloured by disease state. We'll start with the most simple violin plot.
+
+Another thing to note is that our cell type data is in wide format. Ggplot works best with long data, so lets pivot to long format before plotting.
+
+```{r fig1c_violin}
+
+#######################
+# wide to long format #
+#######################
+
+# convert cell type data to long format
+# the subset cell types based on what was shown in the paper
+cells_long <- cells %>%
+  # later on we will facet the data
+  # facet titles cannot be change within ggplot so the variable names must be
+  # changed themselves. this is why im renaming columns here
+  # the rename function lets you rename columns
+  rename("B cells" = B_cell, 
+         "Macrophages" = Monocytes_macrophages,
+         "Dendritic cells" = Dendritic, 
+         "Goblet cells" = Goblet ,
+         "Neutrophils" = Neutrophil ,
+         "Ciliated cells" = Ciliated) %>%
+  # im going to pivot all cell types to long format
+  pivot_longer(cols = 'B cells':T_cell,
+               names_to = "Cell_type",
+               values_to = "Estimates") %>%
+  # im going to select the cell types the authors included in fig 1c
+  subset(Cell_type %in% c('Ciliated cells', "Macrophages",
+                          "Dendritic cells", 'Goblet cells', "Neutrophils", 
+                          "B cells")) %>%
+  # im goin gto rename viral status now to make it easier to read
+  mutate(Viral_status = factor(Viral_status, 
+                               levels = c("No virus", "SARS-CoV-2", "Other virus")),
+         Cell_type = factor(Cell_type, levels = c('Ciliated cells', "Macrophages",
+                                                  "Dendritic cells", 'Goblet cells', "Neutrophils", 
+                                                  "B cells")))
+
+# quick peek to make sure it looks okay - it does!
+head(cells_long)
+
+###############
+# violin plot #
+###############
+
+# take a moment to explore the violin geom and what options you can control
+# ?geom_violin
+
+# basic ggplot using our long data
+ggplot(data = cells_long, 
+       aes(x=Cell_type, y = Estimates, fill = Viral_status)) +
+  geom_violin()
+
+# Practice: try removing "violin" from the geom specification i.e. (geom_)
+# and see what other plot suggestions pop-up
+```
+
+This plot is quite crowded. One thing we can do to improve the aesthetics is to facet our graph according to cell type. Faceting creates smaller graphs within a single pane to display the data. There are two facet functions: facet_wrap and facet_grid. They are very similar though facet_wrap tends to be better at utilizing screen space. You can specify the number of rows and columns if you wish. 
+```{r fig1c_facet}
+# explore facet_wrap and facet_grid to see what arguments you can specify
+# ?facet_wrap
+# ?facet_grid
+
+ggplot(data = cells_long, aes(x=Cell_type, y = Estimates, fill = Viral_status)) +
+  geom_violin() +
+  facet_wrap(~Cell_type)  # facet the data 
+```
+
+Since we have faceted, we no longer need cell types on the x-axis, we can replace this with viral status instead. 
+```{r fig1c_facet_xaxis}
+ggplot(data = cells_long, aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin() +
+  facet_wrap(~Cell_type)
+```
+
+In the paper, the authors have a white background and no box around the facet titles. We can start playing around with changing theme parameters to accomplish this. Ggplot has predefined themes that are helpful for changing "base" aesthetics. Lets try the default theme theme_bw().
+```{r fig1c_theme_bq}
+ggplot(data = cells_long, aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin() +
+  facet_wrap(~Cell_type) +
+  theme_bw() # default theme
+```
+
+This is better but there is still a box around the title and grid lines are still visible. We can modify these aesthetics using the theme() parameter. Within the theme() parameter we can access specific parts of the plot such as the grid lines, axis lines, and backgrounds. 
+```{r fig1c_gridlines}
+# theme has a lot of controls
+# take a moment to explore what you can change in the plot using theme
+# ?theme
+
+ggplot(data = cells_long, 
+       aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin() +
+  facet_wrap(~Cell_type, scales = "free") +
+  theme_bw() +
+  theme(strip.background = element_blank(), # the box around the facet title
+        axis.line = element_line(colour = "black"), # leave axis lines black
+        panel.grid = element_blank(), # remove grid lines
+        panel.border = element_blank()) # remove border
+```
+
+Given that we've stated the viral status on the x axis, we don't need a legend telling us what colour corresponds to what status. We can remove the legend in theme() by setting the legend position to "none". This helps to clean up our graph. The most beautiful graphs are simple and clean.
+```{r fig1c_remove_legend}
+ggplot(data = cells_long, 
+       aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin() +
+  facet_wrap(~Cell_type, scales = "free") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none") # remove legend
+```
+
+The colours in figure 1C are not the default colours used by ggplot. In ggplot, colour typically refers to the outline of plots and points, while fill corresponds to the colour inside the lines. Colours can be specified either using R colour names or hex values (e.g "#009999"). The list of accetptable R colour names can be accessed by typing colours(). 
+
+![](http://sape.inf.usi.ch/sites/default/files/ggplot2-colour-names.png)
+It is also possible to install and load predefined colour theme packages and select palettes from there. Some examples include ggthemes, ggthemr, RColorBrewer, ggsci, and wesanderson to name a few. 
+
+Back to violin plot. Also notice that the violin plot appears to be transluscent. We can adjust the opacity of plots and points using alpha, which accepts a value from 0 to 1, where 0 is invisible and 1 is opaque. 
+
+Let's adjust the fill, colour, and opacity of the violin plot to match the authors' figure. 
+```{r fig1c_fill_opacity}
+# scale_fill_manual can control more than colour
+# explore it to find out
+# ?scale_fill_manual
+
+ggplot(data = cells_long, 
+       aes(x=Viral_status, y = Estimates, 
+           fill = Viral_status, colour = Viral_status)) +
+  # there is no outline around the violin plots in fig 1c
+  # that means the authors set colour to "NA"
+  geom_violin(alpha = 0.5, color = NA) +
+  # scale_fill_manual allows us to specify colours
+  # factored varibles will be coloured in the order which they appear
+  scale_fill_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  facet_wrap(~Cell_type, scales = "free") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none")
+```
+
+The violins now looks a little broken at the top. The authors set their y axis limits at 1.5*IQR above the third quartile. Let's revisit our data and use the tidy method to get the values we should use for our y axis limits. We can omit this data one of two ways: 
+
+1. We can remove the data above the cut off
+2. We can change the y axis limits to exclude points above the cut off. 
+
+Facet wrap doesnt allow users to specify x or y axis limits directly, but we can use a custom facet function (built off facet_wrap) that allows us to specify limits. For learning purposes we will both subset the data, and set the y-axis limits manually using the custom function.
+```{r fig1c_yaxis}
+
+################# 
+# y axis limits #
+#################
+
+# ?ylim
+
+# get y lims based on iqr
+iqr <- cells_long %>%
+  # group by viral status and cell type
+  group_by(Cell_type, Viral_status) %>%
+  # get the interquartile range and third quartile for each group
+  summarise(IQR(Estimates),
+            quantile(Estimates)[4]) %>%
+  # create a new column to represent the max ylim 
+  mutate(ylim = `quantile(Estimates)[4]` +
+           1.5*`IQR(Estimates)`) %>%
+  # group by cell type
+  group_by(Cell_type) %>%
+  # summarize the max ylim for each cell type
+  summarise(max(ylim))
+
+##########
+# ggplot #
+##########
+
+# custom facet from function from
+# https://fishandwhistle.net/post/2018/modifying-facet-scales-in-ggplot2/
+# ive put these functions into a separate r script that we will source
+source(here("scripts", "custom_facet_wrap.R"))
+
+ggplot(data = cells_long %>% 
+         subset(Cell_type == "Ciliated cells" & Estimates <  iqr$`max(ylim)`[1] |
+                  Cell_type == "Macrophages" & Estimates <  iqr$`max(ylim)`[2] |
+                  Cell_type == "Dendritic cells" & Estimates <  iqr$`max(ylim)`[3] |
+                  Cell_type == "Goblet cells" & Estimates <  iqr$`max(ylim)`[4] |
+                  Cell_type == "Neutrophils" & Estimates <  iqr$`max(ylim)`[5] |
+                  Cell_type == "B cells" & Estimates <  iqr$`max(ylim)`[6]), 
+       aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin(alpha = 0.5, colour = NA, trim = T) +
+  scale_fill_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  # facet_wrap(~Cell_type, scales = "free") + # this is original facet function
+  # code for custom y axes on facets
+  facet_wrap_custom(~Cell_type, scales = "free", scale_overrides = list(
+    scale_override(1, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[1], 0.2))),
+    scale_override(2, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[2], 0.2))),
+    scale_override(3, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[3], 0.05))),
+    scale_override(4, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[4], 0.1))),
+    scale_override(5, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[5], 0.2))),
+    scale_override(6, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[6], .05))))) +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none")
+```
+
+In figure 1C, the median is annotated. We can add this in by specifying geom_violin to draw a quantile. However, an issue with calculating the median once we change the y axis limit/subset the data is that the points which were excluded are no longer included in our calculation. Therefore, we must calculate and draw the median line ourselves. Because we are drawing the median lines are selves, we can also get rid of the outline (colour) around the violin plots to make it more consistent with figure 1C. 
+```{r fig1c_median}
+
+############
+# quantile #
+############
+
+# grouping can be very helpful when running stats
+# ?group_by
+# ?add_column
+
+# get median 
+med50 <- cells_long %>%
+  # group_by allows us to group data by multiple variables
+  # stats will be run seprately for each group
+  group_by(Cell_type, Viral_status) %>%
+  # summarize calculates specified summary stats
+  summarise(quantile(Estimates)[3]) %>%
+  # add_column lets us add a new column
+  add_column(x = rep(c(.75,1.75,2.75), 6),
+             xend = rep(c(1.25,2.25,3.25), 6))
+
+########
+# plot #
+########
+
+ggplot(data = cells_long %>% 
+         subset(Cell_type == "Ciliated cells" & Estimates <  iqr$`max(ylim)`[1] |
+                  Cell_type == "Macrophages" & Estimates <  iqr$`max(ylim)`[2] |
+                  Cell_type == "Dendritic cells" & Estimates <  iqr$`max(ylim)`[3] |
+                  Cell_type == "Goblet cells" & Estimates <  iqr$`max(ylim)`[4] |
+                  Cell_type == "Neutrophils" & Estimates <  iqr$`max(ylim)`[5] |
+                  Cell_type == "B cells" & Estimates <  iqr$`max(ylim)`[6]), 
+       aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin(alpha = 0.5, colour = NA, trim = T) +
+  scale_fill_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  # facet_wrap(~Cell_type, scales = "free") + # this is original facet function
+  # code for custom y axes on facets
+  facet_wrap_custom(~Cell_type, scales = "free", scale_overrides = list(
+    scale_override(1, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[1], 0.2))),
+    scale_override(2, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[2], 0.2))),
+    scale_override(3, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[3], 0.05))),
+    scale_override(4, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[4], 0.1))),
+    scale_override(5, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[5], 0.2))),
+    scale_override(6, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[6], .05))))) +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none") +
+  geom_segment(data =  med50, size = 1,
+               aes(y = `quantile(Estimates)[3]`, yend =`quantile(Estimates)[3]`,
+                   x = x, xend=xend))
+```
+
+
+The authors also have points on top. We can add points using geom_point(). The goem for points should come before the geom_segment since the median line appears above both the violin plots and points. Geoms are always drawn in the order you specify. We will set the points to be coloured  by viral status and use the same colours as the violins but greater opacity. 
+```{r fig1c_points}
+# to learn more about geom_segment
+# ?geom_segment
+
+ggplot(data = cells_long %>% 
+         subset(Cell_type == "Ciliated cells" & Estimates <  iqr$`max(ylim)`[1] |
+                  Cell_type == "Macrophages" & Estimates <  iqr$`max(ylim)`[2] |
+                  Cell_type == "Dendritic cells" & Estimates <  iqr$`max(ylim)`[3] |
+                  Cell_type == "Goblet cells" & Estimates <  iqr$`max(ylim)`[4] |
+                  Cell_type == "Neutrophils" & Estimates <  iqr$`max(ylim)`[5] |
+                  Cell_type == "B cells" & Estimates <  iqr$`max(ylim)`[6]), 
+       aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin(alpha = 0.5, colour = NA, trim = T) +
+  geom_point(aes(colour = Viral_status)) +  # add the points
+  scale_fill_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  facet_wrap_custom(~Cell_type, scales = "free", scale_overrides = list(
+    scale_override(1, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[1], 0.2))),
+    scale_override(2, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[2], 0.2))),
+    scale_override(3, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[3], 0.05))),
+    scale_override(4, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[4], 0.1))),
+    scale_override(5, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[5], 0.2))),
+    scale_override(6, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[6], .05))))) +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none") +
+  geom_segment(data =  med50, size = 1,
+               aes(y = `quantile(Estimates)[3]`, yend =`quantile(Estimates)[3]`,
+                   x = x, xend=xend))
+```
+
+As you can see, adding points with geom_point isnt very informative because there is a great degree of overlap. It's possible to plot the points in a way so there is less overlap, making the data more clear. It looks as though the authors have using a beeswarm plot. I've included (but commented out) two other ways to accomplish similar looks using geom_jitter and geom_dotplot.
+```{r fig1c_advanced_points}
+# for more information on jittering and dotplots
+# ?geom_jitter
+# ?geom_dotplot
+
+ggplot(data = cells_long %>% 
+         subset(Cell_type == "Ciliated cells" & Estimates <  iqr$`max(ylim)`[1] |
+                  Cell_type == "Macrophages" & Estimates <  iqr$`max(ylim)`[2] |
+                  Cell_type == "Dendritic cells" & Estimates <  iqr$`max(ylim)`[3] |
+                  Cell_type == "Goblet cells" & Estimates <  iqr$`max(ylim)`[4] |
+                  Cell_type == "Neutrophils" & Estimates <  iqr$`max(ylim)`[5] |
+                  Cell_type == "B cells" & Estimates <  iqr$`max(ylim)`[6]), 
+       aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin(alpha = 0.5, colour = NA, trim = T) +
+  # geom_dotplot(binaxis='y',
+  #              stackdir = "center",
+  #              binwidth = 1/1000,
+  #              aes(col = Viral_status)) +
+  #geom_jitter(height = 0, aes(color = Viral_status)) + 
+  geom_beeswarm(aes(color = Viral_status),
+                corral = "gutter", # this takes overlapping points and pushes them towards the centre
+                corral.width = 0.7,
+                size = 1,
+                cex = 2.5) +  scale_fill_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  facet_wrap_custom(~Cell_type, scales = "free", scale_overrides = list(
+    scale_override(1, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[1], 0.2))),
+    scale_override(2, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[2], 0.2))),
+    scale_override(3, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[3], 0.05))),
+    scale_override(4, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[4], 0.1))),
+    scale_override(5, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[5], 0.2))),
+    scale_override(6, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[6], .05))))) +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none") +
+  geom_segment(data =  med50, size = 1,
+               aes(y = `quantile(Estimates)[3]`, yend =`quantile(Estimates)[3]`,
+                   x = x, xend=xend))
+```
+
+The text is a little messy on the graph. Let's format this to look better. We can change the size, font, and spacing.
+```{r fig1c_text}
+# element_text gives us lots of control over text properties
+# check out which ones you might want to altering using this argument 
+# ?element_text
+
+ggplot(data = cells_long %>% 
+         subset(Cell_type == "Ciliated cells" & Estimates <  iqr$`max(ylim)`[1] |
+                  Cell_type == "Macrophages" & Estimates <  iqr$`max(ylim)`[2] |
+                  Cell_type == "Dendritic cells" & Estimates <  iqr$`max(ylim)`[3] |
+                  Cell_type == "Goblet cells" & Estimates <  iqr$`max(ylim)`[4] |
+                  Cell_type == "Neutrophils" & Estimates <  iqr$`max(ylim)`[5] |
+                  Cell_type == "B cells" & Estimates <  iqr$`max(ylim)`[6]), 
+       aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin(alpha = 0.5, colour = NA, trim = T) +
+  geom_beeswarm(aes(color = Viral_status),
+                corral = "gutter", # this takes overlapping points and pushes them towards the centre
+                corral.width = 0.7,
+                size = 1,
+                cex = 2.5) +  scale_fill_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  # custom x axis labels with new lines
+  scale_x_discrete(labels = c("No \nvirus", "SARS-\nCoV-2", "Other \nvirus")) +
+  # change y axis name
+  labs(y = "Cell type fraction") + 
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  facet_wrap_custom(~Cell_type, scales = "free", scale_overrides = list(
+    scale_override(1, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[1], 0.2))),
+    scale_override(2, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[2], 0.2))),
+    scale_override(3, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[3], 0.05))),
+    scale_override(4, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[4], 0.1))),
+    scale_override(5, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[5], 0.2))),
+    scale_override(6, scale_y_continuous(breaks = seq(0, iqr$`max(ylim)`[6], .05))))) +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(size=12), # change facet title size
+        axis.text.x = element_text(size=10), # change x axis text size
+        axis.text.y = element_text(size=10), # change y axis text size
+        axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_blank()) + # remove x title
+  geom_segment(data =  med50, size = 1,
+               aes(y = `quantile(Estimates)[3]`, yend =`quantile(Estimates)[3]`,
+                   x = x, xend=xend))
+```
+
+
+
+Pairwise comparisons between patient groups were performed with a two-sided Mann–Whitney–Wilcoxon test (non-parametric) followed by Bonferroni correction for multiple tests. For two sample comparisons like t-tests and the mann-whitney, data can be in either long or wide format, but the format will affect how you call on your data. In the former, you will have to subset for each group. In the latter, you can simply specify a column. We can either use the ggsignif package to simultaneously run the MW tests and  add significance bars or use geom_segment and geom_text to create and annotate significance comparisons between groups. Alternatively, some individuals opt to draw the significance bars in themselves after figure create using something like powerpoint. If you look closely at figure 1C, it seems the authors have gone with the latter (drawing in the bars after figure creation). Because we've excluded points by changing the y limits, the stat function in ggsignif will not consider all of all data so we should calculate significance ourselves. We can do some data manipulation using tidyverse to make this easier.  
+
+The mann whiteney tests
+```{r mann_whitney}
+# almost all base R stats are easy to call
+# the most important this is to make sure your data is formatted properly
+# and that you are making the comparisons you think you are
+# for more information on stats
+# ?mann.whitney
+# ?t.test
+# ?ks.test
+# ?anova
+# etc....
+
+# sars-cov-2 vs none
+sc2_other_mw <- cells_long %>%
+  # subset for the viral statuses we are comparing
+  subset(Viral_status %in% c("SARS-CoV-2", "Other virus")) %>%
+  # group according to the comparisons
+  group_by(Cell_type, Viral_status) %>%
+  # summarize estimates into list to clean up
+  summarise(value = list(Estimates)) %>%
+  # make columns equal to lists of estimates for viral status (rows are cell type)
+  spread(Viral_status, value) %>%
+  # group by cell type
+  group_by(Cell_type) %>%
+  # mann whitney tests
+  mutate(pvalue = wilcox.test(x=unlist(`SARS-CoV-2`),
+                              y=unlist(`Other virus`),
+                              # multiple pvalue by 3 for bonferroni correction 
+                              # since there are 3 comparisons for each group
+                              alternative = "two.sided" )$p.value*3) %>%
+  # add columns to specify formatting for line segments
+  add_column(xmin = 2.1, 
+             xmax = 2.9,
+             x = 2.5,
+             y_position = c(0.76, 0.6, 0.15, 0.23, 0.6, 0.15),
+             y_position_text = c(0.805, 0.635, 0.16, 0.245, 0.635, 0.16),
+             Viral_status = "SARS-CoV-2",
+             comparison = "sc2_other")
+
+
+# sars-cov-2 vs non3
+sc2_none_mw <- cells_long %>%
+  subset(Viral_status %in% c("SARS-CoV-2", "No virus")) %>%
+  group_by(Cell_type, Viral_status) %>%
+  summarise(value = list(Estimates)) %>%
+  spread(Viral_status, value) %>%
+  group_by(Cell_type) %>%
+  mutate(pvalue = wilcox.test(x=unlist(`SARS-CoV-2`),
+                              y=unlist(`No virus`),
+                              alternative = "two.sided" )$p.value*3) %>%
+  add_column(xmin = 1.1,
+             xmax = 1.9,
+             x = 1.5,
+             y_position = c(0.76, 0.6, 0.15, 0.23, 0.6, 0.15),
+             y_position_text = c(0.805, 0.635, 0.16, 0.245, 0.635, 0.16),
+             Viral_status = "Other virus",
+             comparison = "sc2_none")
+
+# other vs none
+none_other_mw <- cells_long %>%
+  subset(Viral_status %in% c("Other virus", "No virus")) %>%
+  group_by(Cell_type, Viral_status) %>%
+  summarise(value = list(Estimates)) %>%
+  spread(Viral_status, value) %>%
+  group_by(Cell_type) %>%
+  mutate(pvalue = wilcox.test(x=unlist(`Other virus`),
+                              y=unlist(`No virus`),
+                              alternative = "two.sided" )$p.value*3) %>%
+  add_column(xmin = 1.1,
+             xmax = 2.9,
+             x = 2,
+             y_position = c(0.88, 0.7, 0.18, 0.27, 0.72, 0.18),
+             y_position_text = c(0.925, 0.735, 0.19, 0.285, 0.755, 0.19),
+             Viral_status = "No virus",
+             comparison = "other_none")
+
+# rbind together 
+mw_test <- rbind(sc2_other_mw %>% dplyr::select(Cell_type, pvalue:comparison), 
+                 sc2_none_mw %>% dplyr::select(Cell_type, pvalue:comparison),
+                 none_other_mw %>% dplyr::select(Cell_type, pvalue:comparison)) 
+```
+
+
+The plot with error bars
+```{r fig1_sig_bars}
+ggplot(data = cells_long %>% 
+         subset(Cell_type == "Ciliated cells" & Estimates <  iqr$`max(ylim)`[1] |
+                  Cell_type == "Macrophages" & Estimates <  iqr$`max(ylim)`[2] |
+                  Cell_type == "Dendritic cells" & Estimates <  iqr$`max(ylim)`[3] |
+                  Cell_type == "Goblet cells" & Estimates <  iqr$`max(ylim)`[4] |
+                  Cell_type == "Neutrophils" & Estimates <  iqr$`max(ylim)`[5] |
+                  Cell_type == "B cells" & Estimates <  iqr$`max(ylim)`[6]), 
+       aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin(alpha = 0.5, colour = NA, trim = T) +
+  geom_beeswarm(aes(color = Viral_status),
+                corral = "gutter", # this takes overlapping points and pushes them towards the centre
+                corral.width = 0.7,
+                size = 1,
+                cex = 2.5) +  scale_fill_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  # custom x axis labels with new lines
+  scale_x_discrete(labels = c("No \nvirus", "SARS-\nCoV-2", "Other \nvirus")) +
+  # change y axis name
+  labs(y = "Cell type fraction") + 
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  facet_wrap_custom(~Cell_type, scales = "free", scale_overrides = list(
+    scale_override(1, scale_y_continuous(breaks = seq(0, 1, 0.2),
+                                         limits = c(0,1))),
+    scale_override(2, scale_y_continuous(breaks = seq(0, 0.8, 0.2),
+                                         limits = c(0,0.8))),
+    scale_override(3, scale_y_continuous(breaks = seq(0, 0.2, 0.05),
+                                         limits = c(0,0.2))),
+    scale_override(4, scale_y_continuous(breaks = seq(0, 0.3, 0.1),
+                                         limits = c(0,0.3))),
+    scale_override(5, scale_y_continuous(breaks = seq(0, 0.8, 0.2),
+                                         limits = c(0,0.8))),
+    scale_override(6, scale_y_continuous(breaks = seq(0, 0.2, .05),
+                                         limits = c(0,0.2))))) +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(size=12), # change facet title size
+        axis.text.x = element_text(size=10), # change x axis text size
+        axis.text.y = element_text(size=10), # change y axis text size
+        axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_blank()) + # remove x title
+  geom_segment(data = med50, size = 1,
+               aes(y = `quantile(Estimates)[3]`, yend =`quantile(Estimates)[3]`,
+                   x = x, xend=xend)) +
+  geom_segment(data =  mw_test, size = 0.5,
+               aes(y = y_position, yend =y_position,
+                   x = xmin, xend=xmax))  +
+  # signif rounds and uses scientific notation where required
+  geom_text(data = mw_test, 
+            aes(x = x, y = y_position_text, label = signif(pvalue, 2)), size = 3.5)
+```
+
+Though the paper did not use ggsignif, let's practice adding errors bars to the plot of ciliated cells (without omitting data) to see what the process looks like. We could consider combining graphs like this using cowplot (see practice below)! 
+```{r ggsignif}
+# ?geom_signif
+
+# plot and ggsignif do the math
+ggplot(data = cells_long %>% 
+         subset(Cell_type == "Ciliated cells"), 
+       aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin(alpha = 0.5, colour = NA, trim = F) +
+  geom_beeswarm(aes(color = Viral_status),
+                corral = "gutter", # this takes overlapping points and pushes them towards the centre
+                corral.width = 0.7,
+                size = 1,
+                cex = 1.5) +  
+  scale_fill_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  scale_color_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  scale_y_continuous(breaks = seq(0,1,.2), limits = c(0,1.15))+
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(size=12), # change facet title size
+        axis.text.x = element_text(size=10), # change x axis text size
+        axis.text.y = element_text(size=10), # change y axis text size
+        axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none") + 
+  #ylim(0,1.2) +
+  facet_wrap(.~Cell_type) +
+  labs(x = "Viral status") +
+  # it is easier to control the position of each comparison when
+  # they are draw separately from one another
+  geom_signif(comparisons = list(c("SARS-CoV-2", "No virus")),
+              y_position = 0.9,
+              extend_line = -0.3) +
+  geom_signif(comparisons = list(c("SARS-CoV-2", "Other virus")),
+              y_position = 0.9,
+              extend_line = -0.3) +
+  geom_signif(comparisons = list(c("Other virus", "No virus")),
+              y_position = 1.05,
+              extend_line = -0.615)
+
+
+# ggsignif does not correct for multiple comparisons
+# we can annotate with our own pvalue 
+ggplot(data = cells_long %>% 
+         subset(Cell_type == "Ciliated cells"), 
+       aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin(alpha = 0.5, colour = NA, trim = F) +
+  geom_beeswarm(aes(color = Viral_status),
+                corral = "gutter", # this takes overlapping points and pushes them towards the centre
+                corral.width = 0.7,
+                size = 1,
+                cex = 1.5) +  
+  scale_fill_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  scale_color_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  scale_y_continuous(breaks = seq(0,1,.2), limits = c(0,1.15))+
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(size=12), # change facet title size
+        axis.text.x = element_text(size=10), # change x axis text size
+        axis.text.y = element_text(size=10), # change y axis text size
+        axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none") + 
+  #ylim(0,1.2) +
+  facet_wrap(.~Cell_type) +
+  labs(x = "Viral status") +
+  # it is easier to control the position of each comparison when
+  # they are draw separately from one another
+  geom_signif(comparisons = list(c("SARS-CoV-2", "No virus")),
+              y_position = 0.9,
+              extend_line = -0.3,
+              annotations = sc2_none_mw %>% 
+                subset(Cell_type == "Ciliated cells") %>% 
+                pull(pvalue) %>%
+                # set sig figures 
+                signif(.,digits = 2)) +
+  geom_signif(comparisons = list(c("SARS-CoV-2", "Other virus")),
+              y_position = 0.9,
+              extend_line = -0.3,
+              annotations = sc2_other_mw %>% 
+                subset(Cell_type == "Ciliated cells") %>% 
+                pull(pvalue) %>%
+                # set sig figures 
+                signif(.,digits = 2)) +
+  geom_signif(comparisons = list(c("Other virus", "No virus")),
+              y_position = 1.05,
+              extend_line = -0.615,
+              annotations = none_other_mw %>% 
+                subset(Cell_type == "Ciliated cells") %>% 
+                pull(pvalue) %>%
+                # set sig figures 
+                signif(.,digits = 2))
+
+
+# For practice
+# try adding comparison bars to a plot of just B cells (without omitting data)
+# using ggsignif
+# For a harder (and not really possible challenge)
+# try adding significance comparisons to the faceted graph above
+
+# hints
+# https://stackoverflow.com/questions/56219468/using-ggsignif-with-grouped-bar-graphs-and-facet-wrap-not-working
+# https://stackoverflow.com/questions/45136550/how-to-annotate-different-values-for-each-facet-bar-plot-on-r
+# hint: it's not going to be perfect 
+
+```
+
+
+
+We are so close. However, our violin plots look a little skinny. The violin plot geom has an option to modify how the scale is calculated. If the scale is set to "area" (default) all violins have the same area (before trimming the tails). If the scale is set to "count" areas are scaled proportionally to the number of observations, and if the scale is set to  "width" all violins have the same maximum width. Based on the fig 1c, it looks like the authors used scale set to "width". Looking closely it also looks like their points might be a little transparent. We will set alpha of the beeswarm points as well.
+```{r scale_width}
+# we looked at this before
+# but taking a second look tells us we might have missed something in the scale
+# ?geom_violin
+
+ggplot(data = cells_long %>% 
+         subset(Cell_type == "Ciliated cells" & Estimates <  iqr$`max(ylim)`[1] |
+                  Cell_type == "Macrophages" & Estimates <  iqr$`max(ylim)`[2] |
+                  Cell_type == "Dendritic cells" & Estimates <  iqr$`max(ylim)`[3] |
+                  Cell_type == "Goblet cells" & Estimates <  iqr$`max(ylim)`[4] |
+                  Cell_type == "Neutrophils" & Estimates <  iqr$`max(ylim)`[5] |
+                  Cell_type == "B cells" & Estimates <  iqr$`max(ylim)`[6]), 
+       aes(x=Viral_status, y = Estimates, fill = Viral_status)) +
+  geom_violin(alpha = 0.4, colour = NA, trim = T, scale = "width") +
+  geom_beeswarm(aes(color = Viral_status),
+                corral = "gutter", # this takes overlapping points and pushes them towards the centre
+                corral.width = 0.7,
+                size = 1,
+                cex = 2.5,
+                alpha = 0.8) +  
+  scale_fill_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  # custom x axis labels with new lines
+  scale_x_discrete(labels = c("No \nvirus", "SARS-\nCoV-2", "Other \nvirus")) +
+  # change y axis name
+  labs(y = "Cell type fraction") + 
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  facet_wrap_custom(~Cell_type, scales = "free", scale_overrides = list(
+    scale_override(1, scale_y_continuous(breaks = seq(0, 1, 0.2),
+                                         limits = c(0,1))),
+    scale_override(2, scale_y_continuous(breaks = seq(0, 0.8, 0.2),
+                                         limits = c(0,0.8))),
+    scale_override(3, scale_y_continuous(breaks = seq(0, 0.2, 0.05),
+                                         limits = c(0,0.2))),
+    scale_override(4, scale_y_continuous(breaks = seq(0, 0.3, 0.1),
+                                         limits = c(0,0.3))),
+    scale_override(5, scale_y_continuous(breaks = seq(0, 0.8, 0.2),
+                                         limits = c(0,0.8))),
+    scale_override(6, scale_y_continuous(breaks = seq(0, 0.2, .05),
+                                         limits = c(0,0.2))))) +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(size=12), # change facet title size
+        axis.text.x = element_text(size=10), # change x axis text size
+        axis.text.y = element_text(size=10), # change y axis text size
+        axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_blank()) + # remove x title
+  geom_segment(data = med50, size = 1,
+               aes(y = `quantile(Estimates)[3]`, yend =`quantile(Estimates)[3]`,
+                   x = x, xend=xend)) +
+  geom_segment(data =  mw_test, size = 0.5,
+               aes(y = y_position, yend =y_position,
+                   x = xmin, xend=xmax))  +
+  # signif rounds and uses scientific notation where required
+  geom_text(data = mw_test, 
+            aes(x = x, y = y_position_text, label = signif(pvalue, 2)), size = 3.5)
+```
+
+
+And that's it! That's about as close as we can get to the original plot. You may be asking why we can't replicate it directly and that's because the authors likely finished editing the figure in powerpoint after making the plot. The main clue pointing to this is the fact that their significance bars are above their plot - something that R cannot do. Additionally, they have two y-axis titles - one for the top half and one for the bottom. While it's possible to accomplish this in R, it's more likely it was done after the fact. It's okay to do some figure editing (like adding in titles and significance comparisons) after, but doing more in R helps to ensure reproducibility! 
+
+Today we covered faceting, but it possible to recreate a multi-panel figure without faceting using the R package "cowplot". Cowplot takes individual plots and combines them into a paneled figure. For practice, try recreating figure 1C using cowplot instead the facet geom. Cowplot is nice because it lets you control the aspect ratio of figures compared to each other. Additionally, since we are using cowplot, it will now be easier to incorporate error bars using ggsignif. Try practicing using this as well!
+```{r cowplot}
+# ?plot_grid
+# ?ggsignif
+
+# hint - you should annotate the significance bars yourself!
+
+# plotting hints:
+
+# start with individual plots
+# ciliated_plot <- ggplot() + ggsignif()
+# macrophage_plot <- ggplot() + ggsignif()
+# dendritic_plot <- ggplot() + ggsignif()
+# goblet_plot <- ggplot() + ggsignif()
+# neutrophil_plot <- ggplot() + ggsignif()
+# bcell_plot <- ggplot() + ggsignif()
+
+# then combine in cowplot
+# plot_grid(ciliated_plot, macrophage_plot, dendritic_plot,
+#           goblet_plot, neutrophil_plot, bcell_plot,
+#           nrow = 2, ncol = 3)
+```
+
+
+### Figure 1D: Scatter plots of normalized gene counts for four "inflammasome" related-genes (IL1B, IL1A, CCL3, NLRP3) as a function of SARS-CoV-2 viral load 
+
+This figure includes 4 panels for different genes that were determined to be differentially expressed between SARS-CoV-2 and other viral acute respiratory infections. The points are coloured according to the infection status of the participant (red  = other virus, blue = SARS-CoV-2, dark grey = healthy). There is also a regression line with shaded confidence intervals. The text to the right of each plot was likely added in during post-processing in powerpoint. We'll do our best to replicate this figure. 
+
+Let's start with creating a separate plot for each gene. This is a little trickier than figure 1C because we need gene counts from one data frame and meta-data (infection status from another). Thankfully, we already made sure that each data frame has the same order of participants. We can either combine this data before plotting, or call on the data separately in ggplot. I prefer to combine data, because then I can be confident our comparisons are always correct.
+
+Combine gene count and infection status data. 
+```{r gene_count_infection_status}
+# double check we have the correct orders
+identical(pdata_sub$participant_ID, rownames(exp_norm$targets)) # TRUE
+
+# combine normalized gene expression for IL1B, IL1A, CCL3, and NLPR3 with pdata
+# expression for each gene by participant by row
+# so transpose "t()" before binding
+pdata_sub_exp <- cbind(pdata_sub, 
+                       # limma quantile norm of gene expression 
+                       normalizeQuantiles(exp_sub) %>% 
+                         as.data.frame() %>%
+                         subset(rownames(.) %in% 
+                                  (gene_list %>% 
+                                     subset(hgnc_symbol %in% 
+                                              c("IL1B", "IL1A", 
+                                                "CCL3", "NLRP3")) %>% 
+                                     pull(ensembl_gene_id))) %>% 
+                         t() %>%
+                         as.data.frame() %>%
+                         rename("IL1A" = ENSG00000115008,
+                                "IL1B" = ENSG00000125538,
+                                "NLRP3" = ENSG00000162711,
+                                "CCL3" = ENSG00000277632)) %>%
+  # reorder factor levels disease states to match figure 1c
+  # this way our colouring will be consistently specified 
+  mutate(disease_state = factor(disease_state, 
+                                levels = c("novirus", "SC2", "othervirus")))
+```
+
+Now that are data is organized we can create the plots. The base of the plot is simply just a geom_point coloured by infection status. There are no grid lines, no panel border, and no legend. 
+```{r fig1d}
+# you can assign a ggplot to a named variable
+# every time you want to add a new geom you can simply at it to variable
+# and then reassign
+# e.g
+# plot < - ggplot() + geom_point()
+# plot <- plot + geom_hline()
+
+# however if you want to remove a specific geom you will need to start 
+# from you base plot
+
+# IL1B plot
+il1b_plot <- ggplot(data = pdata_sub_exp, aes(x=log10(sarscov2_pcr), 
+                                              y = log2(IL1B), 
+                                              colour = disease_state)) +
+  geom_point() +
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  theme_bw() + # change theme
+  theme(legend.position = "none", # remove legend
+        panel.grid.major = element_blank(), # remove grid
+        panel.grid.minor = element_blank(), # remove grid
+        panel.border = element_blank(), # remove border
+        axis.line = element_line(colour = "black"))  # keep axis lines
+
+il1b_plot
+
+# IL1A plot
+il1a_plot <- ggplot(data = pdata_sub_exp, aes(x=log10(sarscov2_pcr), 
+                                              y = log2(IL1A), 
+                                              colour = disease_state)) +
+  geom_point() +
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  theme_bw() + # change theme
+  theme(legend.position = "none", # remove legend
+        panel.grid.major = element_blank(), # remove grid
+        panel.grid.minor = element_blank(), # remove grid
+        panel.border = element_blank(), # remove border
+        axis.line = element_line(colour = "black"))  # keep axis lines
+
+il1a_plot
+
+# CCL3 plot
+ccl3_plot <- ggplot(data = pdata_sub_exp, aes(x=log10(sarscov2_pcr), 
+                                              y = log2(CCL3), 
+                                              colour = disease_state)) +
+  geom_point() +
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  theme_bw() + # change theme
+  theme(legend.position = "none", # remove legend
+        panel.grid.major = element_blank(), # remove grid
+        panel.grid.minor = element_blank(), # remove grid
+        panel.border = element_blank(), # remove border
+        axis.line = element_line(colour = "black"))  # keep axis 
+
+ccl3_plot
+
+# NPRL3 plot
+nlrp3_plot <- ggplot(data = pdata_sub_exp, aes(x=log10(sarscov2_pcr), 
+                                               y = log2(NLRP3), 
+                                               colour = disease_state)) +
+  geom_point() +
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  theme_bw() + # change theme
+  theme(legend.position = "none", # remove legend
+        panel.grid.major = element_blank(), # remove grid
+        panel.grid.minor = element_blank(), # remove grid
+        panel.border = element_blank(), # remove border
+        axis.line = element_line(colour = "black"))  # keep axis lines
+
+nlrp3_plot
+```
+
+Another you might have noticed is that the authors added in a vertical line at x=0. We can add one in to each of our figures using geom_vline(). There exists a similar geom for creating vertical lines (geom_vline) as well as geom to specify the slope and intercept of a line (geom_abline).
+
+There are different line type in R and you can specify using a character string or number code. I prefer character strings as they are easily interpreted by humans.
+
+![](http://www.cookbook-r.com/Graphs/Shapes_and_line_types/figure/line_types-1.png)
+It looks like the authors used a long dashed line, so let's try that. We set the type of line using "linetype". It's also posisible to change the width using "size" and specify the line colour using "colour"
+```{r fig1d_vertical_line}
+# ?geom_vline
+
+il1b_plot <- il1b_plot +
+  geom_vline(xintercept = 0, # set the x intercept of vertical line
+             linetype = "longdash") # specify the line type
+
+il1b_plot
+
+il1a_plot <- il1a_plot +
+  geom_vline(xintercept = 0, # set the x intercept of vertical line
+             linetype = "longdash") # specify the line type
+
+il1a_plot
+
+ccl3_plot <- ccl3_plot +
+  geom_vline(xintercept = 0, # set the x intercept of vertical line
+             linetype = "longdash") # specify the line type
+
+ccl3_plot
+
+nlrp3_plot <- nlrp3_plot +
+  geom_vline(xintercept = 0, # set the x intercept of vertical line
+             linetype = "longdash") # specify the line type
+
+nlrp3_plot
+
+# for practice, try changing the line colour and width
+```
+
+The authors included a regression line between the log10 of SARS-CoV-2 reads per million and the limma quantile normalize counts of SARS-CoV-2 patients. Ggplot has a function called geom_smooth that will automatically draw regression lines. Here is an example below. The shaded areas represent the 95% confidence intervals. You can adjust the confidence intervals using the level argument. The default smoothing function using is "lm" (a linear regression).
+```{r regression_line_geom_smooth}
+# ? geom_smooth
+
+il1b_plot +
+  # only draw line for SARS-CoV-2
+  geom_smooth(data = pdata_sub_exp %>% 
+                subset(disease_state == "SC2") , 
+              method='lm')
+```
+
+In the article the authors stsated they used the robustbase package to conduct their linear regression. For consistency we'll do the same and the draw the lines back on our plots. We specify the model the same way we would if we were to be using the lm function in base R. They also include covariates for gender and age. 
+```{r robust_base}
+# create log transformed variables
+pdata_sub_exp <- pdata_sub_exp %>%
+  mutate(IL1B_log2 = log2(IL1B),
+         IL1A_log2 = log2(IL1A),
+         CCL3_log2 = log2(CCL3),
+         NLRP3_log2 = log2(NLRP3),
+         sarscov2_pcr_log10 = log10(sarscov2_pcr))
+
+
+il1b_rob <- lmrob(IL1B_log2 ~ sex + age + sarscov2_pcr_log10,
+                  data = pdata_sub_exp %>% 
+                    subset(disease_state == "SC2") %>%
+                    subset(sarscov2_pcr_log10 >= 0))
+
+il1a_rob <- lmrob(IL1A_log2 ~ sex + age + sarscov2_pcr_log10,
+                  data = pdata_sub_exp %>% 
+                    subset(disease_state == "SC2") %>%
+                    subset(sarscov2_pcr_log10 >= 0))
+
+ccl3_rob <- lmrob(CCL3_log2 ~ sex + age + sarscov2_pcr_log10,
+                  data = pdata_sub_exp %>% 
+                    subset(disease_state == "SC2") %>%
+                    subset(sarscov2_pcr_log10 >= 0))
+
+nlrp3_rob <- lmrob(NLRP3_log2 ~ sex + age + sarscov2_pcr_log10,
+                   data = pdata_sub_exp %>% 
+                     subset(disease_state == "SC2") %>%
+                     subset(sarscov2_pcr_log10 >= 0))
+```
+
+When working with multiple linear regressions, sometimes authors only want to plot the relationship of the main exposure variable of interest against the outcome, while holding the covariates constant - this is called a marginal effect. The authors used the package ggeffects to calculate marginal effects. 
+```{r marginal_effects}
+# Model predictions based on the marginal effects of log10(rpM)
+# change the column names for plotting
+# add in extra column for disease state so no errors are thrown
+
+il1b_me <- ggpredict(model = il1b_rob,  terms = "sarscov2_pcr_log10") %>%
+  mutate(disease_state = "SC2") %>%
+  rename("sarscov2_pcr" = x,
+         "IL1B" = "predicted")
+
+il1a_me <- ggpredict(model = il1a_rob,  terms = "sarscov2_pcr_log10") %>%
+  mutate(disease_state = "SC2") %>%
+  rename("sarscov2_pcr" = x,
+         "IL1A" = "predicted")
+
+ccl3_me <- ggpredict(model = ccl3_rob,  terms = "sarscov2_pcr_log10") %>%
+  mutate(disease_state = "SC2") %>%
+  rename("sarscov2_pcr" = x,
+         "CCL3" = "predicted")
+
+nlrp3_me <- ggpredict(model = nlrp3_rob,  terms = "sarscov2_pcr_log10") %>%
+  mutate(disease_state = "SC2") %>%
+  rename("sarscov2_pcr" = x,
+         "NLRP3" = "predicted")
+```
+
+
+Now we can plot the regression line using geom_line to create the line, and geom_ribbon to create the shaded confidence intervals.
+```{r fig1d_regression_line}
+
+# IL1B plot
+il1b_plot <- ggplot(data = pdata_sub_exp, aes(x=log10(sarscov2_pcr), 
+                                              y = log2(IL1B), 
+                                              colour = disease_state)) +
+  geom_point() +
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  geom_vline(xintercept = 0, # set the x intercept of vertical line
+             linetype = "longdash") + # specify the line type
+  theme_bw() + # change theme
+  theme(legend.position = "none", # remove legend
+        panel.grid.major = element_blank(), # remove grid
+        panel.grid.minor = element_blank(), # remove grid
+        panel.border = element_blank(), # remove border
+        axis.line = element_line(colour = "black")) +  # keep axis lines
+  geom_line(data = il1b_me, 
+            aes(x=sarscov2_pcr, y = IL1B), 
+            colour = "grey30",
+            size = 1) +
+  geom_ribbon(data = il1b_me, 
+              aes(ymin = conf.low, ymax = conf.high, x = sarscov2_pcr), 
+              alpha = .1,
+              colour = NA) 
+
+il1b_plot
+
+# IL1A plot
+il1a_plot <- ggplot(data = pdata_sub_exp, aes(x=log10(sarscov2_pcr), 
+                                              y = log2(IL1A), 
+                                              colour = disease_state)) +
+  geom_point() +
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  geom_vline(xintercept = 0, # set the x intercept of vertical line
+             linetype = "longdash") + # specify the line type
+  theme_bw() + # change theme
+  theme(legend.position = "none", # remove legend
+        panel.grid.major = element_blank(), # remove grid
+        panel.grid.minor = element_blank(), # remove grid
+        panel.border = element_blank(), # remove border
+        axis.line = element_line(colour = "black")) +  # keep axis lines
+  geom_line(data = as.data.frame(il1a_me), 
+            aes(x=sarscov2_pcr, y = IL1A), 
+            colour = "grey30",
+            size = 1) +
+  geom_ribbon(data = il1a_me, 
+              aes(ymin = conf.low, ymax = conf.high, x = sarscov2_pcr), 
+              alpha = .1,
+              colour = NA) 
+
+il1a_plot
+
+# CCL3 plot
+ccl3_plot <- ggplot(data = pdata_sub_exp, aes(x=log10(sarscov2_pcr), 
+                                              y = log2(CCL3), 
+                                              colour = disease_state)) +
+  geom_point() +
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  geom_vline(xintercept = 0, # set the x intercept of vertical line
+             linetype = "longdash") + # specify the line type
+  theme_bw() + # change theme
+  theme(legend.position = "none", # remove legend
+        panel.grid.major = element_blank(), # remove grid
+        panel.grid.minor = element_blank(), # remove grid
+        panel.border = element_blank(), # remove border
+        axis.line = element_line(colour = "black")) + # keep axis
+  geom_line(data = ccl3_me, 
+            aes(x=sarscov2_pcr, y = CCL3), 
+            colour = "grey30",
+            size = 1) +
+  geom_ribbon(data = ccl3_me, 
+              aes(ymin = conf.low, ymax = conf.high, x = sarscov2_pcr), 
+              alpha = .1,
+              colour = NA) 
+
+ccl3_plot
+
+# NPRL3 plot
+nlrp3_plot <- ggplot(data = pdata_sub_exp, aes(x=log10(sarscov2_pcr), 
+                                               y = log2(NLRP3), 
+                                               colour = disease_state)) +
+  geom_point() +
+  scale_colour_manual(values=c("darkgrey", "skyblue", "indianred1")) + 
+  geom_vline(xintercept = 0, # set the x intercept of vertical line
+             linetype = "longdash") + # specify the line type
+  theme_bw() + # change theme
+  theme(legend.position = "none", # remove legend
+        panel.grid.major = element_blank(), # remove grid
+        panel.grid.minor = element_blank(), # remove grid
+        panel.border = element_blank(), # remove border
+        axis.line = element_line(colour = "black")) + # keep axis lines
+  geom_line(data = nlrp3_me, 
+            aes(x=sarscov2_pcr, y = NLRP3), 
+            colour = "grey30",
+            size = 1) +
+  geom_ribbon(data = nlrp3_me, 
+              aes(ymin = conf.low, ymax = conf.high, x = sarscov2_pcr), 
+              alpha = .1,
+              colour = NA) 
+
+nlrp3_plot
+```
+
+The last thing we need to do is add titles, fix our axis naming, and combine all four plots into 1. The r base function expression() can be used to create super- and sub-scripts
+```{r fig1d_axis_titles}
+# ?expression
+# ?ggtitle
+# ?theme
+
+# IL1B
+il1b_plot <- il1b_plot + 
+  labs(x = expression("SARS-CoV-2"~log[10](rpM)), 
+       y = expression(log[2]~(norm~counts))) +
+  ggtitle(expression(italic("IL1B"))) + # italicize using expression()
+  theme(plot.title = element_text(hjust = 0.5, size = 18), # centre title
+        axis.text = element_text(size = 12), # adjust size
+        axis.title = element_text(size = 12)) # adjust size
+
+il1b_plot
+
+# IL1A
+il1a_plot <- il1a_plot + 
+  labs(x = expression("SARS-CoV-2"~log[10](rpM)), 
+       y = expression(log[2]~(norm~counts))) +
+  ggtitle(expression(italic("IL1A"))) + # italicize using expression()
+  theme(plot.title = element_text(hjust = 0.5, size = 18), # centre title
+        axis.text = element_text(size = 12), # adjust size
+        axis.title = element_text(size = 12)) # adjust size
+
+il1a_plot
+
+# CCL3
+ccl3_plot <- ccl3_plot + 
+  labs(x = expression("SARS-CoV-2"~log[10](rpM)), 
+       y = expression(log[2]~(norm~counts))) +
+  ggtitle(expression(italic("CCL3"))) + # italicize using expression()
+  theme(plot.title = element_text(hjust = 0.5, size = 18), # centre title
+        axis.text = element_text(size = 12), # adjust size
+        axis.title = element_text(size = 12)) # adjust size
+
+ccl3_plot
+
+# NLRP3
+nlrp3_plot <- nlrp3_plot + 
+  labs(x = expression("SARS-CoV-2"~log[10](rpM)), 
+       y = expression(log[2]~(norm~counts))) +
+  ggtitle(expression(italic("NLRP3"))) + # italicize using expression()
+  theme(plot.title = element_text(hjust = 0.5, size = 18), # centre title
+        axis.text = element_text(size = 12), # adjust size
+        axis.title = element_text(size = 12)) # adjust size
+
+nlrp3_plot
+```
+
+
+Finally, let's combine using cowplot
+```{r fig1d_cowplot}
+# plot grid in cowplot 
+fig1d <- plot_grid(il1b_plot, il1a_plot, ccl3_plot, nlrp3_plot,
+                   nrow=2, ncol=2)
+
+fig1d 
+```
+
+### Error bars
+
+Commonly researchers may want to display error bars standard deviation/standard error or confidence intervals on a graph. This is easily accomplished using geom_errorbar(). Though the figures we looked at didn't include this, it's an important skill to practice. Let's create a bar plot of IL1B differential expression for our three comparisons. We will have to do some data wrangling before we make our plot 
+
+```{r error_bars}
+############### 
+# format data #
+###############
+
+il1b_de <- de %>% 
+  # get gene of interest
+  subset(hgnc_symbol == "IL1B") %>% 
+  # select columns we might want
+  dplyr::select(sc_novirus_logFC, sc_novirus_CI.L, sc_novirus_CI.R, 
+                sc_novirus_P.Value, sc_other_logFC, sc_other_CI.L, 
+                sc_other_CI.R, sc_other_P.Value, other_novirus_logFC, 
+                other_novirus_CI.L, other_novirus_CI.R, 
+                other_novirus_P.Value, hgnc_symbol) %>%
+  # pivot longer
+  pivot_longer(cols = !hgnc_symbol,              
+               names_to = "names",
+               values_to="values") %>%
+  # separate name of comparison and type of stat into individual columns
+  extract(names, into = c("Comparison", "stat"), "(.*)_([^_]+)$") %>%
+  # put each stat in their own column
+  pivot_wider(names_from = stat,
+              values_from = values) 
+
+ggplot(il1b_de, aes(x=Comparison, y = logFC)) +
+  geom_col() +
+  geom_errorbar(aes(ymin=logFC-CI.L, ymax=logFC+CI.L), # specify length using ymin./xmin
+                width = 0.2) + # specify the width of the bars
+  geom_hline(yintercept=0, size = 0.2) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"))
+
+```
+
+
+### Extra practice
+
+#### Volcano plot
+
+A volcano plot is commonly used to display the results from limma. For gene expression data, the x-axis is typically represents log2 of gene expression and the y-axis represents the log10 of unadjusted p-values. Often, points which are considered significant based on p-value and differential expression are highlighted by using a different colour.
+
+As an example, Figures 1A and 1 B the paper titled ["Comparative transcriptome analyses reveal genes associated with SARS-CoV-2 infection of human lung epithelial cells"](https://www.nature.com/articles/s41598-021-95733-w) demonstrate volcano plots with significant points coloured.
+
+![](https://media.springernature.com/full/springer-static/image/art%3A10.1038%2Fs41598-021-95733-w/MediaObjects/41598_2021_95733_Fig1_HTML.png?as=webp)
+
+Try making a volcano plot for the comparison between SARS-CoV-2 infections and health controls (no virus). 
+
+```{r volcano}
+# ggplot() +
+#  geom_point() +
+#  geom_hline() + # add in a line for p value significance
+#  geom_vline()   # add in a line for gene expression significance
+
+```
